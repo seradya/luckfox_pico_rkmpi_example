@@ -68,16 +68,18 @@ FILE* ffmpeg_pipe = nullptr;
 
 bool open_rtsp_pipe()
 {
-    std::string cmd =
-        "ffmpeg "
-        "-rtsp_transport tcp "
-        "-i " + RTSP_URL + " "
-        "-f rawvideo "
-        "-pix_fmt bgr24 "
-        "-vf scale=" + std::to_string(width) + ":" + std::to_string(height) + " "
-        "-an -sn -dn "
-        "-loglevel error "
-        "-";
+	std::string cmd =
+    	"ffmpeg "
+    	"-rtsp_transport tcp "
+    	"-fflags nobuffer+discardcorrupt "
+    	"-flags low_delay "
+    	"-i " + RTSP_URL + " "
+    	"-f rawvideo "
+    	"-pix_fmt bgr24 "
+    	"-vf scale=" + std::to_string(width) + ":" + std::to_string(height) + " "
+    	"-an -sn -dn "
+    	"-loglevel error "
+    	"-";
 
     printf("Run: %s\n", cmd.c_str());
 
@@ -100,6 +102,41 @@ void mapCoordinates(int *x, int *y) {
     *y = (int)((float)my / scale);
 }
 
+#if USE_RTSP_INPUT
+bool reconnect_rtsp()
+{
+    printf("Reconnect RTSP stream...\n");
+
+    if (ffmpeg_pipe)
+    {
+        pclose(ffmpeg_pipe);
+        ffmpeg_pipe = nullptr;
+    }
+
+    sleep(1);
+
+    int retry = 0;
+
+    while (retry < 10)
+    {
+        printf("Reconnect attempt %d...\n", retry + 1);
+
+        if (open_rtsp_pipe())
+        {
+            printf("RTSP reconnect success\n");
+            return true;
+        }
+
+        retry++;
+
+        sleep(1);
+    }
+
+    printf("RTSP reconnect failed\n");
+
+    return false;
+}
+#endif
 
 int main(int argc, char *argv[]) {
   system("RkLunch-stop.sh");
@@ -149,6 +186,7 @@ int main(int argc, char *argv[]) {
 	unsigned char *data = (unsigned char *)RK_MPI_MB_Handle2VirAddr(src_Blk);
 	cv::Mat frame(cv::Size(width,height),CV_8UC3,data);
 
+	#if !USE_RTSP_INPUT
 	// rkaiq init
 	RK_BOOL multi_sensor = RK_FALSE;	
 	const char *iq_dir = "/etc/iqfiles";
@@ -156,6 +194,7 @@ int main(int argc, char *argv[]) {
 	//hdr_mode = RK_AIQ_WORKING_MODE_ISP_HDR2;
 	SAMPLE_COMM_ISP_Init(0, hdr_mode, multi_sensor, iq_dir);
 	SAMPLE_COMM_ISP_Run(0);
+	#endif
 
 	// rkmpi init
 	if (RK_MPI_SYS_Init() != RK_SUCCESS) {
@@ -171,9 +210,11 @@ int main(int argc, char *argv[]) {
 	rtsp_set_video(g_rtsp_session, RTSP_CODEC_ID_VIDEO_H264, NULL, 0);
 	rtsp_sync_video_ts(g_rtsp_session, rtsp_get_reltime(), rtsp_get_ntptime());
 	
+	#if !USE_RTSP_INPUT
 	// vi init
 	vi_dev_init();
 	vi_chn_init(0, width, height);
+	#endif
 
 	// venc init
 	RK_CODEC_ID_E enCodecType = RK_VIDEO_ID_AVC;
@@ -205,7 +246,14 @@ int main(int argc, char *argv[]) {
 		if (read_bytes != frame_size)
 		{
 			printf("RTSP frame read error\n");
-			break;
+			
+			if (!reconnect_rtsp())
+			{
+				printf("Reconnect failed. Continue waiting...\n");
+				continue;
+			}
+			
+			continue;
 		}
 		
 		cv::Mat bgr(height, width, CV_8UC3, data);
@@ -241,20 +289,20 @@ int main(int argc, char *argv[]) {
 		}
 		#endif
 			
-			//letterbox
-			cv::Mat letterboxImage = letterbox(frame);	
-			memcpy(rknn_app_ctx.input_mems[0]->virt_addr, letterboxImage.data, model_width*model_height*3);		
-			// inference_yolov5_model(&rknn_app_ctx, &od_results);
-			auto infer_start = std::chrono::high_resolution_clock::now();
+		//letterbox
+		cv::Mat letterboxImage = letterbox(frame);	
+		memcpy(rknn_app_ctx.input_mems[0]->virt_addr, letterboxImage.data, model_width*model_height*3);		
+		// inference_yolov5_model(&rknn_app_ctx, &od_results);
+		auto infer_start = std::chrono::high_resolution_clock::now();
 
-			ret = rknn_run(rknn_app_ctx.rknn_ctx, nullptr);
+		ret = rknn_run(rknn_app_ctx.rknn_ctx, nullptr);
 			
-			auto infer_end = std::chrono::high_resolution_clock::now();
+		auto infer_end = std::chrono::high_resolution_clock::now();
 			
-			if (ret < 0) {
-				printf("RKNN run failed! Error code: %d\n", ret);
-				continue;
-			}
+		if (ret < 0) {
+			printf("RKNN run failed! Error code: %d\n", ret);
+			continue;
+		}
 			
 			// Время инференса в миллисекундах
 			float infer_time = std::chrono::duration<float, std::milli>(
@@ -342,10 +390,12 @@ int main(int argc, char *argv[]) {
 	// Destory Pool
 	RK_MPI_MB_DestroyPool(src_Pool);
 	
+	#if !USE_RTSP_INPUT
 	RK_MPI_VI_DisableChn(0, 0);
 	RK_MPI_VI_DisableDev(0);
 
 	SAMPLE_COMM_ISP_Stop(0);
+	#endif
 	
 	RK_MPI_VENC_StopRecvFrame(0);
 	RK_MPI_VENC_DestroyChn(0);
