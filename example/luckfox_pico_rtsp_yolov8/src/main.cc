@@ -12,6 +12,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <vector>
+#include <chrono>
 
 #include "rtsp_demo.h"
 #include "luckfox_mpi.h"
@@ -144,7 +145,10 @@ int main(int argc, char *argv[]) {
 	RK_CODEC_ID_E enCodecType = RK_VIDEO_ID_AVC;
 	venc_init(0, width, height, enCodecType);
 
-	printf("venc init success\n");	
+	printf("venc init success\n");
+
+	float fps = 0.0f;
+	char fps_text[32];
 	
   	while(1)
 	{	
@@ -166,11 +170,23 @@ int main(int argc, char *argv[]) {
 			cv::Mat letterboxImage = letterbox(frame);	
 			memcpy(rknn_app_ctx.input_mems[0]->virt_addr, letterboxImage.data, model_width*model_height*3);		
 			// inference_yolov5_model(&rknn_app_ctx, &od_results);
+			auto infer_start = std::chrono::high_resolution_clock::now();
+
 			ret = rknn_run(rknn_app_ctx.rknn_ctx, nullptr);
+			
+			auto infer_end = std::chrono::high_resolution_clock::now();
+			
 			if (ret < 0) {
 				printf("RKNN run failed! Error code: %d\n", ret);
-				continue; // Пропускаем этот кадр
+				continue;
 			}
+			
+			// Время инференса в миллисекундах
+			float infer_time = std::chrono::duration<float, std::milli>(
+								   infer_end - infer_start).count();
+			
+			// FPS инференса
+			fps = 1000.0f / infer_time;
 			object_detect_result_list od_results;
 	
 			post_process(&rknn_app_ctx, rknn_app_ctx.output_mems, 0.25, 0.45, &od_results);
@@ -200,6 +216,16 @@ int main(int argc, char *argv[]) {
 										   cv::Scalar(0,255,0),2);
 				}
 			}
+
+			sprintf(fps_text, "FPS: %.2f", fps);
+
+			cv::putText(frame,
+            			fps_text,
+            			cv::Point(20, 40),
+            			cv::FONT_HERSHEY_SIMPLEX,
+            			1.0,
+            			cv::Scalar(0, 0, 255),
+            			2);
 
 		}
 		memcpy(data, frame.data, width * height * 3);					
