@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include <vector>
 #include <chrono>
+#include <string>
 
 #include "rtsp_demo.h"
 #include "luckfox_mpi.h"
@@ -24,6 +25,11 @@
 
 #define DISP_WIDTH  720
 #define DISP_HEIGHT 480
+
+#define USE_RTSP_INPUT 1
+
+const std::string RTSP_URL =
+    "rtsp://172.32.0.100:8554/live";
 
 // disp size
 int width    = DISP_WIDTH;
@@ -56,6 +62,34 @@ cv::Mat letterbox(cv::Mat input)
     inputScale.copyTo(letterboxImage(roi));
 
 	return letterboxImage; 	
+}
+
+FILE* ffmpeg_pipe = nullptr;
+
+bool open_rtsp_pipe()
+{
+    std::string cmd =
+        "ffmpeg "
+        "-rtsp_transport tcp "
+        "-i " + RTSP_URL + " "
+        "-f rawvideo "
+        "-pix_fmt bgr24 "
+        "-vf scale=" + std::to_string(width) + ":" + std::to_string(height) + " "
+        "-an -sn -dn "
+        "-loglevel error "
+        "-";
+
+    printf("Run: %s\n", cmd.c_str());
+
+    ffmpeg_pipe = popen(cmd.c_str(), "r");
+
+    if (!ffmpeg_pipe)
+    {
+        printf("Failed to open ffmpeg pipe\n");
+        return false;
+    }
+
+    return true;
 }
 
 void mapCoordinates(int *x, int *y) {	
@@ -147,6 +181,13 @@ int main(int argc, char *argv[]) {
 
 	printf("venc init success\n");
 
+	#if USE_RTSP_INPUT
+	if (!open_rtsp_pipe())
+	{
+		return -1;
+	}
+	#endif
+
 	float fps = 0.0f;
 	char fps_text[32];
 	
@@ -155,16 +196,50 @@ int main(int argc, char *argv[]) {
 		// get vi frame
 		h264_frame.stVFrame.u32TimeRef = H264_TimeRef++;
 		h264_frame.stVFrame.u64PTS = TEST_COMM_GetNowUs(); 
+		#if USE_RTSP_INPUT
+
+		size_t frame_size = width * height * 3;
+		size_t read_bytes =
+			fread(data, 1, frame_size, ffmpeg_pipe);
+		
+		if (read_bytes != frame_size)
+		{
+			printf("RTSP frame read error\n");
+			break;
+		}
+		
+		cv::Mat bgr(height, width, CV_8UC3, data);
+		frame = bgr.clone();
+		
+		#else
+		
 		s32Ret = RK_MPI_VI_GetChnFrame(0, 0, &stViFrame, -1);
+		
 		if(s32Ret == RK_SUCCESS)
 		{
-			void *vi_data = RK_MPI_MB_Handle2VirAddr(stViFrame.stVFrame.pMbBlk);	
-
-			cv::Mat yuv420sp(height + height / 2, width, CV_8UC1, vi_data);
-			cv::Mat bgr(height, width, CV_8UC3, data);			
-			
-			cv::cvtColor(yuv420sp, bgr, cv::COLOR_YUV420sp2BGR);
-			cv::resize(bgr, frame, cv::Size(width ,height), 0, 0, cv::INTER_LINEAR);
+			void *vi_data =
+				RK_MPI_MB_Handle2VirAddr(stViFrame.stVFrame.pMbBlk);
+		
+			cv::Mat yuv420sp(height + height / 2,
+							 width,
+							 CV_8UC1,
+							 vi_data);
+			cv::Mat bgr(height,
+						width,
+						CV_8UC3,
+						data);
+			cv::cvtColor(yuv420sp,
+						 bgr,
+						 cv::COLOR_YUV420sp2BGR);
+		
+			cv::resize(bgr,
+					   frame,
+					   cv::Size(width,height),
+					   0,
+					   0,
+					   cv::INTER_LINEAR);
+		}
+		#endif
 			
 			//letterbox
 			cv::Mat letterboxImage = letterbox(frame);	
@@ -227,7 +302,6 @@ int main(int argc, char *argv[]) {
             			cv::Scalar(0, 0, 255),
             			2);
 
-		}
 		memcpy(data, frame.data, width * height * 3);					
 		
 		// encode H264
@@ -248,10 +322,13 @@ int main(int argc, char *argv[]) {
 		}
 
 		// release frame 
+		#if !USE_RTSP_INPUT
 		s32Ret = RK_MPI_VI_ReleaseChnFrame(0, 0, &stViFrame);
+		
 		if (s32Ret != RK_SUCCESS) {
 			RK_LOGE("RK_MPI_VI_ReleaseChnFrame fail %x", s32Ret);
 		}
+		#endif
 		s32Ret = RK_MPI_VENC_ReleaseStream(0, &stFrame);
 		if (s32Ret != RK_SUCCESS) {
 			RK_LOGE("RK_MPI_VENC_ReleaseStream fail %x", s32Ret);
@@ -277,7 +354,14 @@ int main(int argc, char *argv[]) {
 
 	if (g_rtsplive)
 		rtsp_del_demo(g_rtsplive);
-	
+
+	#if USE_RTSP_INPUT
+	if (ffmpeg_pipe)
+	{
+		pclose(ffmpeg_pipe);
+	}
+	#endif
+
 	RK_MPI_SYS_Exit();
 
 	// Release rknn model
