@@ -1,0 +1,3 @@
+[submodule "cross-compiler"]
+	path = sdk
+	url = https://github.com/LuckfoxTECH/luckfox-pico/
