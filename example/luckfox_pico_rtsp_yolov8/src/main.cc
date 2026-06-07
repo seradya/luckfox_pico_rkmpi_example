@@ -522,7 +522,23 @@ int main(int argc, char *argv[])
                         cv::Scalar(0, 255, 0), 2);
         }
 
-        snprintf(fps_text, sizeof(fps_text), "FPS: %.2f", fps);
+        // Реальный FPS выходного видео: интервал между отданными кадрами
+        // ВЫБРАННОЙ камеры (а не время инференса). При нескольких камерах на
+        // выбранную приходится меньше кадров → частота честно падает.
+        // Сглаживаем экспоненциальным средним, чтобы цифра не дёргалась.
+        static auto  last_out_ts  = std::chrono::steady_clock::now();
+        static float out_fps      = 0.0f;
+        static int   last_out_cam = -1;
+        auto  now_ts = std::chrono::steady_clock::now();
+        float dt_ms  = std::chrono::duration<float, std::milli>(now_ts - last_out_ts).count();
+        if (ci == last_out_cam && dt_ms > 0.0f) {
+            float inst = 1000.0f / dt_ms;
+            out_fps = (out_fps <= 0.0f) ? inst : (out_fps * 0.9f + inst * 0.1f);
+        }
+        last_out_ts  = now_ts;
+        last_out_cam = ci;
+
+        snprintf(fps_text, sizeof(fps_text), "FPS: %.2f", out_fps);
         cv::putText(draw_frame[cur], fps_text, cv::Point(20, 40),
                     cv::FONT_HERSHEY_SIMPLEX, 1.0,
                     cv::Scalar(0, 0, 255), 2);
