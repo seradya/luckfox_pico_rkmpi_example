@@ -17,6 +17,23 @@ extern std::mutex cameras_mutex;
 // Переключается кнопкой Stream в веб-интерфейсе.
 extern std::atomic<int> g_stream_camera;
 
+// Настройки экспорта результатов инференса (MQTT-брокер + JSON-файлы).
+// Задаются через веб-интерфейс, читаются пайплайном.
+struct MqttSettings {
+    bool        mqtt_enabled = false;
+    std::string host;
+    int         port = 1883;
+    std::string user;
+    std::string pass;
+    std::string base_topic = "frigate";
+
+    bool        json_enabled = false;
+    std::string json_dir = "/tmp";
+};
+
+// Потокобезопасный снимок текущих настроек экспорта.
+MqttSettings get_mqtt_settings();
+
 // Генерация HTML страницы
 std::string generate_html();
 

@@ -27,6 +27,41 @@ std::mutex cameras_mutex;
 // Камера, чей инференс уходит в выходной стрим (по умолчанию 0).
 std::atomic<int> g_stream_camera{0};
 
+// Настройки экспорта (MQTT/JSON). Доступ только под mqtt_settings_mutex.
+static MqttSettings g_mqtt_settings;
+static std::mutex   g_mqtt_settings_mutex;
+
+MqttSettings get_mqtt_settings() {
+    std::lock_guard<std::mutex> lk(g_mqtt_settings_mutex);
+    return g_mqtt_settings;
+}
+
+// Простейшие извлекатели значений из плоского JSON-тела запроса.
+static std::string json_get_string(const std::string &body, const char *key,
+                                   const std::string &def) {
+    std::string pat = std::string("\"") + key + "\":\"";
+    size_t p = body.find(pat);
+    if (p == std::string::npos) return def;
+    size_t s = p + pat.size();
+    size_t e = body.find('"', s);
+    if (e == std::string::npos) return def;
+    return body.substr(s, e - s);
+}
+
+static int json_get_int(const std::string &body, const char *key, int def) {
+    std::string pat = std::string("\"") + key + "\":";
+    size_t p = body.find(pat);
+    if (p == std::string::npos) return def;
+    return atoi(body.c_str() + p + pat.size());
+}
+
+static bool json_get_bool(const std::string &body, const char *key, bool def) {
+    std::string pat = std::string("\"") + key + "\":";
+    size_t p = body.find(pat);
+    if (p == std::string::npos) return def;
+    return body.compare(p + pat.size(), 4, "true") == 0;
+}
+
 // Флаг успешной проверки (под тем же мьютексом).
 static std::vector<bool> camera_ok = {
     false,
@@ -115,6 +150,28 @@ std::string generate_html() {
 
         "</div>"
 
+        "<div style='margin-top:20px;padding:10px;background:#2a2a2a;border-radius:5px;max-width:560px;'>"
+        "<h2>Detection export (MQTT / Frigate JSON)</h2>"
+        "<label><input type='checkbox' id='m_en'> Enable MQTT</label><br><br>"
+        "Broker host: <input type='text' id='m_host' "
+        "style='width:220px;background:#333;color:#fff;border:1px solid #555;padding:4px;'> "
+        "Port: <input type='text' id='m_port' "
+        "style='width:70px;background:#333;color:#fff;border:1px solid #555;padding:4px;'><br><br>"
+        "User: <input type='text' id='m_user' "
+        "style='width:150px;background:#333;color:#fff;border:1px solid #555;padding:4px;'> "
+        "Pass: <input type='password' id='m_pass' "
+        "style='width:150px;background:#333;color:#fff;border:1px solid #555;padding:4px;'><br><br>"
+        "Base topic: <input type='text' id='m_topic' "
+        "style='width:200px;background:#333;color:#fff;border:1px solid #555;padding:4px;'>"
+        "<br><br>"
+        "<label><input type='checkbox' id='m_json'> Save JSON file</label> "
+        "dir: <input type='text' id='m_dir' "
+        "style='width:200px;background:#333;color:#fff;border:1px solid #555;padding:4px;'>"
+        "<br><br>"
+        "<button onclick='saveMqtt()'>Save export settings</button>"
+        "<span id='m_st' style='margin-left:10px'></span>"
+        "</div>"
+
         "<script>";
 
     html += "var cams=[";
@@ -135,6 +192,16 @@ std::string generate_html() {
     html += "];";
 
     html += "var stream=" + std::to_string(g_stream_camera.load()) + ";";
+
+    {
+        MqttSettings ms = get_mqtt_settings();
+        html += "var mq={en:" + std::string(ms.mqtt_enabled ? "true" : "false") +
+                ",host:\"" + ms.host + "\",port:" + std::to_string(ms.port) +
+                ",user:\"" + ms.user + "\",pass:\"" + ms.pass +
+                "\",topic:\"" + ms.base_topic +
+                "\",json:" + std::string(ms.json_enabled ? "true" : "false") +
+                ",dir:\"" + ms.json_dir + "\"};";
+    }
 
     html +=
         "var tested=[];"
@@ -211,7 +278,38 @@ std::string generate_html() {
         "x.send(JSON.stringify({i:i}));"
         "}"
 
+        // Заполнить форму экспорта текущими настройками.
+        "function mqttFill(){"
+        "document.getElementById('m_en').checked=mq.en;"
+        "document.getElementById('m_host').value=mq.host;"
+        "document.getElementById('m_port').value=mq.port;"
+        "document.getElementById('m_user').value=mq.user;"
+        "document.getElementById('m_pass').value=mq.pass;"
+        "document.getElementById('m_topic').value=mq.topic;"
+        "document.getElementById('m_json').checked=mq.json;"
+        "document.getElementById('m_dir').value=mq.dir;"
+        "}"
+
+        "function saveMqtt(){"
+        "var o={"
+        "enabled:document.getElementById('m_en').checked,"
+        "host:document.getElementById('m_host').value,"
+        "port:parseInt(document.getElementById('m_port').value)||1883,"
+        "user:document.getElementById('m_user').value,"
+        "pass:document.getElementById('m_pass').value,"
+        "topic:document.getElementById('m_topic').value,"
+        "jsonfile:document.getElementById('m_json').checked,"
+        "dir:document.getElementById('m_dir').value"
+        "};"
+        "var x=new XMLHttpRequest();"
+        "x.open('POST','/mqtt',true);"
+        "x.setRequestHeader('Content-Type','application/json');"
+        "x.onload=function(){document.getElementById('m_st').innerHTML='Saved';};"
+        "x.send(JSON.stringify(o));"
+        "}"
+
         "init();"
+        "mqttFill();"
 
         "</script>"
 
@@ -379,6 +477,33 @@ void handle_request(struct mg_connection *c,
         mg_http_reply(c, 200,
                       "Content-Type: application/json\r\n",
                       "{\"ok\":false}");
+        return;
+    }
+
+    if (method == "POST" && uri == "/mqtt") {
+        std::string body(hm->body.buf, hm->body.len);
+
+        MqttSettings s;
+        s.mqtt_enabled = json_get_bool(body, "enabled", false);
+        s.host         = json_get_string(body, "host", "");
+        s.port         = json_get_int(body, "port", 1883);
+        s.user         = json_get_string(body, "user", "");
+        s.pass         = json_get_string(body, "pass", "");
+        s.base_topic   = json_get_string(body, "topic", "frigate");
+        s.json_enabled = json_get_bool(body, "jsonfile", false);
+        s.json_dir     = json_get_string(body, "dir", "/tmp");
+
+        {
+            std::lock_guard<std::mutex> lk(g_mqtt_settings_mutex);
+            g_mqtt_settings = s;
+        }
+
+        printf("[mqtt] settings: mqtt=%d host=%s:%d topic=%s json=%d dir=%s\n",
+               s.mqtt_enabled, s.host.c_str(), s.port, s.base_topic.c_str(),
+               s.json_enabled, s.json_dir.c_str());
+
+        mg_http_reply(c, 200, "Content-Type: application/json\r\n",
+                      "{\"ok\":true}");
         return;
     }
 

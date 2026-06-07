@@ -24,6 +24,7 @@
 #include "luckfox_mpi.h"
 #include "yolov8.h"
 #include "web_server.h"
+#include "mqtt_client.h"
 
 #include "opencv2/core/core.hpp"
 #include "opencv2/highgui/highgui.hpp"
@@ -46,6 +47,13 @@
 
 // HTTP-порт веб-интерфейса настройки камер.
 #define WEB_SERVER_PORT 8080
+
+// Минимальный интервал между экспортами (JSON/MQTT) на одну камеру, мс —
+// чтобы не заваливать брокер/диск кадрами на полной частоте.
+#define EXPORT_MIN_INTERVAL_MS 250
+
+// Глобальный MQTT-публикатор (асинхронный, фоновый поток).
+static MqttClient g_mqtt;
 
 // При нескольких настроенных камерах — сколько секунд обрабатывать одну,
 // прежде чем переключиться на следующую (поочерёдная обработка).
@@ -116,6 +124,52 @@ void mapCoordinates(int *x, int *y)
 {
     *x = (int)(((float)(*x - leftPadding)) / scale);
     *y = (int)(((float)(*y - topPadding))  / scale);
+}
+
+static double now_seconds()
+{
+    return std::chrono::duration<double>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// Сериализация результатов инференса одной камеры в JSON (формат в духе
+// событий Frigate: камера, метка времени, размер кадра и список детекций
+// с боксами в координатах исходного кадра).
+static std::string build_detection_json(int cam,
+                                        object_detect_result_list *od,
+                                        double ts)
+{
+    char buf[192];
+    std::string s = "{";
+    snprintf(buf, sizeof(buf),
+             "\"camera\":\"cam%d\",\"timestamp\":%.3f,", cam, ts);
+    s += buf;
+    snprintf(buf, sizeof(buf),
+             "\"frame_width\":%d,\"frame_height\":%d,\"detections\":[",
+             width, height);
+    s += buf;
+
+    for (int i = 0; i < od->count; i++) {
+        object_detect_result *d = &od->results[i];
+        int x1 = (int)d->box.left,  y1 = (int)d->box.top;
+        int x2 = (int)d->box.right, y2 = (int)d->box.bottom;
+        mapCoordinates(&x1, &y1);
+        mapCoordinates(&x2, &y2);
+        if (x1 < 0) x1 = 0;
+        if (y1 < 0) y1 = 0;
+        if (x2 > width)  x2 = width;
+        if (y2 > height) y2 = height;
+
+        snprintf(buf, sizeof(buf),
+                 "%s{\"label\":\"%s\",\"score\":%.3f,"
+                 "\"box\":[%d,%d,%d,%d],\"area\":%d}",
+                 i ? "," : "", coco_cls_to_name(d->cls_id), d->prop,
+                 x1, y1, x2, y2, (x2 - x1) * (y2 - y1));
+        s += buf;
+    }
+
+    s += "]}";
+    return s;
 }
 
 #if USE_RTSP_INPUT
@@ -287,6 +341,8 @@ int main(int argc, char *argv[])
     std::thread(run_web_server, WEB_SERVER_PORT).detach();
     printf("Web UI: http://<board-ip>:%d (configure up to 4 cameras)\n",
            WEB_SERVER_PORT);
+
+    g_mqtt.start();   // фоновый MQTT-публикатор (бездействует, пока не настроен)
 
     // -------------------------------------------------------------------------
     // RKNN model init
@@ -474,6 +530,39 @@ int main(int argc, char *argv[])
         // Minimal log so we can confirm inference runs for every camera.
         printf("[cam %d] %d objects (infer %.1f fps)%s\n",
                ci, od_results.count, fps, (ci == sel) ? " [STREAM]" : "");
+
+        // ------------------------------------------------------------------
+        // Экспорт результатов инференса: JSON-файл (для Frigate/NVR) и/или
+        // публикация по MQTT. Делается для КАЖДОЙ камеры, с троттлингом.
+        // ------------------------------------------------------------------
+        {
+            static double last_export[MAX_CAMERAS] = {0};
+            MqttSettings ms = get_mqtt_settings();
+
+            if (ms.mqtt_enabled || ms.json_enabled)
+            {
+                double now_s = now_seconds();
+                if ((now_s - last_export[ci]) * 1000.0 >= EXPORT_MIN_INTERVAL_MS)
+                {
+                    last_export[ci] = now_s;
+                    std::string js = build_detection_json(ci, &od_results, now_s);
+
+                    if (ms.json_enabled) {
+                        std::string path =
+                            ms.json_dir + "/cam" + std::to_string(ci) + ".json";
+                        FILE *f = fopen(path.c_str(), "w");
+                        if (f) { fwrite(js.data(), 1, js.size(), f); fclose(f); }
+                    }
+
+                    if (ms.mqtt_enabled && !ms.host.empty()) {
+                        g_mqtt.configure(ms.host, ms.port, ms.user, ms.pass);
+                        g_mqtt.publish(ms.base_topic + "/cam" + std::to_string(ci), js);
+                    } else {
+                        g_mqtt.configure("", 0, "", ""); // выключен — отключаемся
+                    }
+                }
+            }
+        }
 #endif
 
         // Only the camera selected via the web "Stream" button is annotated,
