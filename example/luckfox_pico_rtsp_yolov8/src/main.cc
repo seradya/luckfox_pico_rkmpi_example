@@ -15,10 +15,12 @@
 #include <vector>
 #include <chrono>
 #include <string>
+#include <thread>
 
 #include "rtsp_demo.h"
 #include "luckfox_mpi.h"
 #include "yolov8.h"
+#include "web_server.h"
 
 #include "opencv2/core/core.hpp"
 #include "opencv2/highgui/highgui.hpp"
@@ -39,7 +41,19 @@
 //   slot 2 — we are painting on this one right now
 #define DRAW_BUF_COUNT 5
 
-const std::string RTSP_URL = "rtsp://172.32.0.100:8554/live";
+// HTTP-порт веб-интерфейса настройки камер.
+#define WEB_SERVER_PORT 8080
+
+// При нескольких настроенных камерах — сколько секунд обрабатывать одну,
+// прежде чем переключиться на следующую (поочерёдная обработка).
+// Переключение пересоздаёт ffmpeg (RTSP-коннект ~1-2 c), поэтому слишком
+// маленькое значение неэффективно.
+#define CAMERA_DWELL_SEC 10
+
+// URL по умолчанию для слота камеры 0 — чтобы можно было сразу тестировать
+// с одним источником, не открывая веб-интерфейс. Веб-интерфейс может его
+// переопределить. Также можно передать первым аргументом командной строки.
+const std::string DEFAULT_RTSP_URL = "rtsp://172.32.0.100:8554/live";
 
 int width        = DISP_WIDTH;
 int height       = DISP_HEIGHT;
@@ -83,7 +97,7 @@ unsigned long long rtsp_last_consumed_seq = 0;
 pthread_mutex_t rtsp_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t rtsp_cond = PTHREAD_COND_INITIALIZER;
 
-bool open_rtsp_pipe()
+bool open_rtsp_pipe(const std::string &url)
 {
     // -skip_loop_filter all / -flags2 fast : cut software-decode CPU on the weak
     // Cortex-A7 so ffmpeg can keep up with the source. If the board decodes too
@@ -96,7 +110,7 @@ bool open_rtsp_pipe()
         "-flags low_delay "
         "-flags2 fast "
         "-skip_loop_filter all "
-        "-i " + RTSP_URL + " "
+        "-i " + url + " "
         "-map 0:v:0 "
         "-f rawvideo "
         "-pix_fmt rgb24 "
@@ -207,22 +221,47 @@ static bool start_rtsp_reader(size_t frame_size)
     return true;
 }
 
-bool reconnect_rtsp(size_t frame_size)
+// Tear down any current reader and (re)open ffmpeg for a specific camera URL.
+bool open_camera(const std::string &url, size_t frame_size)
 {
-    printf("Reconnect RTSP stream...\n");
     stop_rtsp_reader();
-    sleep(1);
-    for (int retry = 0; retry < 10; retry++) {
-        printf("Reconnect attempt %d...\n", retry + 1);
-        if (open_rtsp_pipe() && start_rtsp_reader(frame_size)) {
-            printf("RTSP reconnect success\n");
+    if (open_rtsp_pipe(url) && start_rtsp_reader(frame_size))
+        return true;
+
+    if (ffmpeg_pipe) { pclose(ffmpeg_pipe); ffmpeg_pipe = nullptr; }
+    ffmpeg_fd = -1;
+    return false;
+}
+
+// Round-robin index across cameras configured via the web UI.
+static int g_cur_cam = -1;
+
+// Pick the next configured camera and open it.
+// On success fills cur_idx_out / cur_url_out and returns true.
+// Returns false if no camera is configured at all (or none could be opened).
+bool switch_to_next_camera(size_t frame_size, int &cur_idx_out, std::string &cur_url_out)
+{
+    int n = active_camera_count();
+    if (n == 0) {
+        stop_rtsp_reader();
+        return false;
+    }
+
+    // Try every configured camera once before giving up this round.
+    for (int attempt = 0; attempt < n; attempt++) {
+        int idx = g_cur_cam;
+        std::string url;
+        if (!get_next_camera(idx, url))
+            return false;
+        g_cur_cam = idx;
+
+        if (open_camera(url, frame_size)) {
+            cur_idx_out = idx;
+            cur_url_out = url;
             return true;
         }
-        if (ffmpeg_pipe) { pclose(ffmpeg_pipe); ffmpeg_pipe = nullptr; }
-        ffmpeg_fd = -1;
-        sleep(1);
+        printf("Camera %d open failed (%s), trying next...\n", idx, url.c_str());
     }
-    printf("RTSP reconnect failed\n");
     return false;
 }
 
@@ -271,7 +310,25 @@ int main(int argc, char *argv[])
 
     RK_S32 s32Ret = 0;
     int sX, sY, eX, eY;
-    char text[16];
+    char text[64];
+
+    // -------------------------------------------------------------------------
+    // Camera configuration + web server
+    //
+    // Camera URLs are managed by the web UI (port WEB_SERVER_PORT). We seed
+    // slot 0 from argv[1] (or a built-in default) so single-source testing works
+    // out of the box; the web UI can override and add up to 4 cameras.
+    // -------------------------------------------------------------------------
+    {
+        std::lock_guard<std::mutex> lk(cameras_mutex);
+        if (argc > 1 && argv[1][0] != '\0')
+            cameras[0] = argv[1];
+        else if (cameras[0].empty())
+            cameras[0] = DEFAULT_RTSP_URL;
+    }
+    std::thread(run_web_server, WEB_SERVER_PORT).detach();
+    printf("Web UI: http://<board-ip>:%d (configure up to 4 cameras)\n",
+           WEB_SERVER_PORT);
 
     // -------------------------------------------------------------------------
     // RKNN model init
@@ -368,19 +425,17 @@ int main(int argc, char *argv[])
     venc_init(0, width, height, RK_VIDEO_ID_AVC);
     printf("venc init success\n");
 
-#if USE_RTSP_INPUT
-    if (!open_rtsp_pipe()) return -1;
-    if (!start_rtsp_reader(frame_bytes)) {
-        printf("Failed to start RTSP reader thread\n");
-        pclose(ffmpeg_pipe);
-        ffmpeg_pipe = nullptr;
-        ffmpeg_fd = -1;
-        return -1;
-    }
-#endif
-
     float fps      = 0.0f;
     char  fps_text[32];
+
+#if USE_RTSP_INPUT
+    // Active camera state for round-robin processing. The first camera is
+    // selected lazily on the first loop iteration below.
+    int         cur_cam_idx = -1;
+    std::string cur_cam_url;
+    bool        have_cam    = false;
+    time_t      cam_start   = 0;
+#endif
 
     while (1)
     {
@@ -391,10 +446,27 @@ int main(int argc, char *argv[])
         h264_frame.stVFrame.u64PTS     = TEST_COMM_GetNowUs();
 
 #if USE_RTSP_INPUT
+        // (Re)select a camera on startup, after a read error, or when the dwell
+        // time for the current camera has elapsed (round-robin).
+        if (!have_cam)
+        {
+            have_cam = switch_to_next_camera(frame_bytes, cur_cam_idx, cur_cam_url);
+            if (!have_cam)
+            {
+                printf("No camera configured. Open web UI at :%d to add one. Waiting...\n",
+                       WEB_SERVER_PORT);
+                sleep(2);
+                continue;
+            }
+            printf("Now processing camera %d: %s\n", cur_cam_idx, cur_cam_url.c_str());
+            cam_start = time(NULL);
+        }
+
         if (!grab_latest_frame(src_data, frame_bytes))
         {
-            printf("RTSP frame read error\n");
-            if (!reconnect_rtsp(frame_bytes)) { sleep(1); }
+            printf("Camera %d read error, switching/reconnecting...\n", cur_cam_idx);
+            have_cam = false; // re-open (same cam if only one) on next iteration
+            sleep(1);
             continue;
         }
 
@@ -484,6 +556,14 @@ int main(int argc, char *argv[])
                     cv::FONT_HERSHEY_SIMPLEX, 1.0,
                     cv::Scalar(0, 0, 255), 2);
 
+#if USE_RTSP_INPUT
+        char cam_text[32];
+        snprintf(cam_text, sizeof(cam_text), "CAM %d", cur_cam_idx + 1);
+        cv::putText(draw_frame[cur], cam_text, cv::Point(20, 75),
+                    cv::FONT_HERSHEY_SIMPLEX, 1.0,
+                    cv::Scalar(255, 255, 0), 2);
+#endif
+
 		// static int frame_id = 0;
 		// char filename[256];
 		// snprintf(filename,
@@ -530,6 +610,25 @@ int main(int argc, char *argv[])
             if (s32Ret != RK_SUCCESS)
                 RK_LOGE("RK_MPI_VENC_ReleaseStream fail %x", s32Ret);
         }
+
+#if USE_RTSP_INPUT
+        // If the active camera's URL was changed via the web UI, reopen it now.
+        {
+            std::lock_guard<std::mutex> lk(cameras_mutex);
+            if (cur_cam_idx >= 0 && cur_cam_idx < (int)cameras.size() &&
+                !cameras[cur_cam_idx].empty() &&
+                cameras[cur_cam_idx] != cur_cam_url) {
+                have_cam = false;
+            }
+        }
+
+        // Round-robin: after the dwell time, rotate to the next camera.
+        // With a single camera this never triggers (continuous processing).
+        if (active_camera_count() > 1 &&
+            difftime(time(NULL), cam_start) >= CAMERA_DWELL_SEC) {
+            have_cam = false;
+        }
+#endif
 
         memset(text, 0, sizeof(text));
     }
