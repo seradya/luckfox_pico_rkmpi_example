@@ -16,6 +16,9 @@
 #include <chrono>
 #include <string>
 #include <thread>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
 
 #include "rtsp_demo.h"
 #include "luckfox_mpi.h"
@@ -84,26 +87,12 @@ cv::Mat letterbox(const cv::Mat &input)
     return letterboxImage;
 }
 
-FILE *ffmpeg_pipe = nullptr;
-int ffmpeg_fd = -1;
-pthread_t rtsp_reader_tid;
-bool rtsp_reader_started = false;
-bool rtsp_reader_running = false;
-size_t rtsp_frame_size = 0;
-std::vector<unsigned char> rtsp_latest_frame;
-bool rtsp_frame_ready = false;
-unsigned long long rtsp_frame_seq = 0;
-unsigned long long rtsp_last_consumed_seq = 0;
-pthread_mutex_t rtsp_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t rtsp_cond = PTHREAD_COND_INITIALIZER;
-
-bool open_rtsp_pipe(const std::string &url)
+// Build the ffmpeg command that decodes one RTSP source to raw rgb24 frames.
+// -skip_loop_filter all / -flags2 fast cut software-decode CPU on the weak
+// Cortex-A7. -r must match the source fps to avoid speed-up/slow-down.
+static std::string build_ffmpeg_cmd(const std::string &url)
 {
-    // -skip_loop_filter all / -flags2 fast : cut software-decode CPU on the weak
-    // Cortex-A7 so ffmpeg can keep up with the source. If the board decodes too
-    // slowly, mediamtx drops frames upstream, breaking the H264 GOP and producing
-    // the "corrupted macroblock" garbage seen on screen.
-    std::string cmd =
+    return
         "ffmpeg "
         "-rtsp_transport tcp "
         "-fflags nobuffer+discardcorrupt+genpts "
@@ -117,42 +106,10 @@ bool open_rtsp_pipe(const std::string &url)
         "-vf scale=" + std::to_string(width) + ":" + std::to_string(height) + " "
         "-an -sn -dn "
         "-loglevel error "
-        "-r 15 "  // Должно совпадать с fps источника, иначе видео ускоряется/замедляется
-        "-nostdin "  // Не ждать ввода с stdin
-        "-y "  // Перезаписывать выход
+        "-r 15 "
+        "-nostdin "
+        "-y "
         "-";
-
-    printf("Run: %s\n", cmd.c_str());
-    ffmpeg_pipe = popen(cmd.c_str(), "r");
-    if (!ffmpeg_pipe) {
-        printf("Failed to open ffmpeg pipe\n");
-        return false;
-    }
-    setvbuf(ffmpeg_pipe, NULL, _IONBF, 0);
-    ffmpeg_fd = fileno(ffmpeg_pipe);
-    if (ffmpeg_fd < 0) {
-        printf("Failed to get ffmpeg pipe fd\n");
-        pclose(ffmpeg_pipe);
-        ffmpeg_pipe = nullptr;
-        return false;
-    }
-    return true;
-}
-
-static void stop_rtsp_reader()
-{
-    if (!rtsp_reader_started)
-        return;
-
-    rtsp_reader_running = false;
-    if (ffmpeg_pipe) {
-        pclose(ffmpeg_pipe); // unblocks read() in reader thread
-        ffmpeg_pipe = nullptr;
-        ffmpeg_fd = -1;
-    }
-    pthread_cond_broadcast(&rtsp_cond);
-    pthread_join(rtsp_reader_tid, nullptr);
-    rtsp_reader_started = false;
 }
 
 void mapCoordinates(int *x, int *y)
@@ -162,6 +119,10 @@ void mapCoordinates(int *x, int *y)
 }
 
 #if USE_RTSP_INPUT
+
+#define MAX_CAMERAS 4
+#define READER_RETRY_SEC 3
+
 static bool read_exact(int fd, unsigned char *buf, size_t frame_size)
 {
     size_t done = 0;
@@ -180,128 +141,125 @@ static bool read_exact(int fd, unsigned char *buf, size_t frame_size)
     return true;
 }
 
-static void *rtsp_reader_thread(void *arg)
-{
-    (void)arg;
-    std::vector<unsigned char> local(rtsp_frame_size);
+// One independent decoder per camera: its own ffmpeg + reader thread, keeping
+// only the latest decoded frame. The main loop reads the latest frame from each
+// active camera, so switching the output stream between cameras is instant
+// (no ffmpeg reconnect) and inference can run on every camera.
+struct CameraReader {
+    std::string url;
+    FILE *pipe = nullptr;
+    int   fd   = -1;
+    std::thread th;
+    std::atomic<bool> running{false};
+    bool   started      = false;
+    time_t last_attempt = 0;
 
-    while (rtsp_reader_running) {
-        if (ffmpeg_fd < 0 || !read_exact(ffmpeg_fd, local.data(), rtsp_frame_size))
+    std::vector<unsigned char> latest;
+    bool frame_ready = false;
+    unsigned long long seq           = 0;
+    unsigned long long last_consumed = 0;
+    std::mutex mtx;
+    std::condition_variable cv;
+};
+
+static CameraReader g_readers[MAX_CAMERAS];
+static size_t       g_frame_size = 0;
+
+static void reader_loop(CameraReader *r)
+{
+    std::vector<unsigned char> local(g_frame_size);
+    while (r->running.load()) {
+        if (r->fd < 0 || !read_exact(r->fd, local.data(), g_frame_size))
             break;
-
-        pthread_mutex_lock(&rtsp_mutex);
-        rtsp_latest_frame.swap(local);
-        rtsp_frame_ready = true;
-        rtsp_frame_seq++;
-        pthread_cond_signal(&rtsp_cond);
-        pthread_mutex_unlock(&rtsp_mutex);
+        {
+            std::lock_guard<std::mutex> lk(r->mtx);
+            r->latest.swap(local); // local now owns the previous buffer (same size)
+            r->frame_ready = true;
+            r->seq++;
+        }
+        r->cv.notify_all();
     }
-
-    pthread_mutex_lock(&rtsp_mutex);
-    rtsp_reader_running = false;
-    pthread_cond_broadcast(&rtsp_cond);
-    pthread_mutex_unlock(&rtsp_mutex);
-    return nullptr;
+    {
+        std::lock_guard<std::mutex> lk(r->mtx);
+        r->running.store(false);
+    }
+    r->cv.notify_all();
 }
 
-static bool start_rtsp_reader(size_t frame_size)
+static void stop_reader(CameraReader *r)
 {
-    rtsp_frame_size = frame_size;
-    rtsp_latest_frame.assign(frame_size, 0);
-    rtsp_frame_ready = false;
-    rtsp_frame_seq = 0;
-    rtsp_last_consumed_seq = 0;
-    rtsp_reader_running = true;
+    if (!r->started) return;
+    r->running.store(false);
+    if (r->pipe) { pclose(r->pipe); r->pipe = nullptr; r->fd = -1; } // unblocks read()
+    if (r->th.joinable()) r->th.join();
+    r->started     = false;
+    r->frame_ready = false;
+    r->url.clear();
+}
 
-    if (pthread_create(&rtsp_reader_tid, nullptr, rtsp_reader_thread, nullptr) != 0) {
-        rtsp_reader_running = false;
-        return false;
-    }
-    rtsp_reader_started = true;
+static bool start_reader(CameraReader *r, const std::string &url)
+{
+    stop_reader(r);
+
+    std::string cmd = build_ffmpeg_cmd(url);
+    printf("Run: %s\n", cmd.c_str());
+    r->pipe = popen(cmd.c_str(), "r");
+    if (!r->pipe) { printf("ffmpeg popen failed: %s\n", url.c_str()); return false; }
+    setvbuf(r->pipe, NULL, _IONBF, 0);
+    r->fd = fileno(r->pipe);
+    if (r->fd < 0) { pclose(r->pipe); r->pipe = nullptr; return false; }
+
+    r->url           = url;
+    r->latest.assign(g_frame_size, 0);
+    r->frame_ready   = false;
+    r->seq           = 0;
+    r->last_consumed = 0;
+    r->running.store(true);
+    r->th = std::thread(reader_loop, r);
+    r->started = true;
     return true;
 }
 
-// Tear down any current reader and (re)open ffmpeg for a specific camera URL.
-bool open_camera(const std::string &url, size_t frame_size)
+// Copy the latest NEW frame for camera r into buf. Returns false if there is no
+// new frame right now (caller should skip this camera this round).
+static bool grab_reader_frame(CameraReader *r, unsigned char *buf)
 {
-    stop_rtsp_reader();
-    if (open_rtsp_pipe(url) && start_rtsp_reader(frame_size))
-        return true;
-
-    if (ffmpeg_pipe) { pclose(ffmpeg_pipe); ffmpeg_pipe = nullptr; }
-    ffmpeg_fd = -1;
-    return false;
-}
-
-// Round-robin index across cameras configured via the web UI.
-static int g_cur_cam = -1;
-
-// Pick the next configured camera and open it.
-// On success fills cur_idx_out / cur_url_out and returns true.
-// Returns false if no camera is configured at all (or none could be opened).
-bool switch_to_next_camera(size_t frame_size, int &cur_idx_out, std::string &cur_url_out)
-{
-    int n = active_camera_count();
-    if (n == 0) {
-        stop_rtsp_reader();
+    std::lock_guard<std::mutex> lk(r->mtx);
+    if (!r->frame_ready || r->seq == r->last_consumed)
         return false;
-    }
-
-    // Try every configured camera once before giving up this round.
-    for (int attempt = 0; attempt < n; attempt++) {
-        int idx = g_cur_cam;
-        std::string url;
-        if (!get_next_camera(idx, url))
-            return false;
-        g_cur_cam = idx;
-
-        if (open_camera(url, frame_size)) {
-            cur_idx_out = idx;
-            cur_url_out = url;
-            return true;
-        }
-        printf("Camera %d open failed (%s), trying next...\n", idx, url.c_str());
-    }
-    return false;
-}
-
-// Wait for a NEW frame from reader thread and copy it.
-//
-// Timeout must be generous: an RTSP source can take several seconds to connect
-// over TCP and emit its first keyframe. A short timeout here would tear down a
-// still-connecting ffmpeg and loop forever. We only signal an error (→ reconnect)
-// when the reader thread actually dies (ffmpeg exited / EOF) or after a long
-// safety timeout.
-bool grab_latest_frame(unsigned char *buf, size_t frame_size)
-{
-    if (!rtsp_reader_started || frame_size != rtsp_frame_size)
-        return false;
-
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += 15; // safety backstop; normal trigger is reader thread death
-
-    pthread_mutex_lock(&rtsp_mutex);
-    while (rtsp_reader_running &&
-           (!rtsp_frame_ready || rtsp_frame_seq == rtsp_last_consumed_seq)) {
-        int rc = pthread_cond_timedwait(&rtsp_cond, &rtsp_mutex, &ts);
-        if (rc == ETIMEDOUT) {
-            pthread_mutex_unlock(&rtsp_mutex);
-            return false;
-        }
-    }
-    if (!rtsp_frame_ready || rtsp_frame_seq == rtsp_last_consumed_seq) {
-        // Reader thread died (ffmpeg exited) — signal reconnect.
-        pthread_mutex_unlock(&rtsp_mutex);
-        return false;
-    }
-
-    memcpy(buf, rtsp_latest_frame.data(), frame_size);
-    rtsp_last_consumed_seq = rtsp_frame_seq;
-    pthread_mutex_unlock(&rtsp_mutex);
-
+    memcpy(buf, r->latest.data(), g_frame_size);
+    r->last_consumed = r->seq;
     return true;
 }
+
+// Reconcile readers with the web-UI camera list: start readers for added/changed
+// URLs, stop readers for removed cameras, and respawn dead ones with a backoff.
+static void sync_readers()
+{
+    std::vector<std::string> urls = get_all_cameras();
+    time_t now = time(NULL);
+
+    for (int i = 0; i < MAX_CAMERAS && i < (int)urls.size(); i++) {
+        CameraReader *r = &g_readers[i];
+        const std::string &u = urls[i];
+
+        if (u.empty()) {
+            if (r->started) {
+                printf("Camera %d removed, stopping reader\n", i);
+                stop_reader(r);
+            }
+            continue;
+        }
+
+        bool need = (!r->started) || (r->url != u) || (!r->running.load());
+        if (need && (now - r->last_attempt) >= READER_RETRY_SEC) {
+            r->last_attempt = now;
+            printf("Camera %d (re)starting reader: %s\n", i, u.c_str());
+            start_reader(r, u);
+        }
+    }
+}
+
 #endif // USE_RTSP_INPUT
 
 int main(int argc, char *argv[])
@@ -349,6 +307,9 @@ int main(int argc, char *argv[])
     VIDEO_FRAME_INFO_S stViFrame;
 
     const size_t frame_bytes = (size_t)width * height * 3;
+#if USE_RTSP_INPUT
+    g_frame_size = frame_bytes;
+#endif
 
     // -------------------------------------------------------------------------
     // DMA pool — 1 source block + DRAW_BUF_COUNT draw blocks
@@ -429,48 +390,43 @@ int main(int argc, char *argv[])
     char  fps_text[32];
 
 #if USE_RTSP_INPUT
-    // Active camera state for round-robin processing. The first camera is
-    // selected lazily on the first loop iteration below.
-    int         cur_cam_idx = -1;
-    std::string cur_cam_url;
-    bool        have_cam    = false;
-    time_t      cam_start   = 0;
-#endif
-
     while (1)
     {
         // ------------------------------------------------------------------
-        // Step 1: receive the LATEST available raw frame (skip stale ones)
+        // Step 1: keep one ffmpeg decoder per configured camera in sync with
+        //         the web UI, then round-robin across the active cameras so
+        //         inference runs for ALL of them. Only the camera selected via
+        //         the web "Stream" button is encoded to the RTSP output.
         // ------------------------------------------------------------------
-        h264_frame.stVFrame.u32TimeRef = H264_TimeRef++;
-        h264_frame.stVFrame.u64PTS     = TEST_COMM_GetNowUs();
+        sync_readers();
 
-#if USE_RTSP_INPUT
-        // (Re)select a camera on startup, after a read error, or when the dwell
-        // time for the current camera has elapsed (round-robin).
-        if (!have_cam)
-        {
-            have_cam = switch_to_next_camera(frame_bytes, cur_cam_idx, cur_cam_url);
-            if (!have_cam)
-            {
-                printf("No camera configured. Open web UI at :%d to add one. Waiting...\n",
-                       WEB_SERVER_PORT);
-                sleep(2);
-                continue;
-            }
-            printf("Now processing camera %d: %s\n", cur_cam_idx, cur_cam_url.c_str());
-            cam_start = time(NULL);
-        }
+        int active[MAX_CAMERAS];
+        int nactive = 0;
+        for (int i = 0; i < MAX_CAMERAS; i++)
+            if (g_readers[i].started)
+                active[nactive++] = i;
 
-        if (!grab_latest_frame(src_data, frame_bytes))
+        if (nactive == 0)
         {
-            printf("Camera %d read error, switching/reconnecting...\n", cur_cam_idx);
-            have_cam = false; // re-open (same cam if only one) on next iteration
-            sleep(1);
+            printf("No camera configured. Open web UI at :%d to add one. Waiting...\n",
+                   WEB_SERVER_PORT);
+            sleep(2);
             continue;
         }
 
+        static int rr = 0;
+        int ci  = active[rr % nactive];
+        int sel = g_stream_camera.load();
+        rr++;
+
+        if (!grab_reader_frame(&g_readers[ci], src_data))
+        {
+            usleep(5000); // no new frame from this camera yet — avoid busy spin
+            continue;
+        }
 #else
+    while (1)
+    {
         s32Ret = RK_MPI_VI_GetChnFrame(0, 0, &stViFrame, -1);
         if (s32Ret == RK_SUCCESS)
         {
@@ -478,6 +434,7 @@ int main(int argc, char *argv[])
             cv::Mat yuv420sp(height + height / 2, width, CV_8UC1, vi_data);
             cv::cvtColor(yuv420sp, src_frame, cv::COLOR_YUV420sp2RGB);
         }
+        int ci = 0, sel = 0; (void)ci; (void)sel;
 #endif
 
         // ------------------------------------------------------------------
@@ -512,6 +469,20 @@ int main(int argc, char *argv[])
         memset(&od_results, 0, sizeof(od_results));
         post_process(&rknn_app_ctx, rknn_app_ctx.output_mems,
                      0.25f, 0.45f, &od_results);
+
+#if USE_RTSP_INPUT
+        // Minimal log so we can confirm inference runs for every camera.
+        printf("[cam %d] %d objects (infer %.1f fps)%s\n",
+               ci, od_results.count, fps, (ci == sel) ? " [STREAM]" : "");
+#endif
+
+        // Only the camera selected via the web "Stream" button is annotated,
+        // encoded and pushed to the RTSP output. Other cameras run inference
+        // (logged above) but produce no output.
+        if (ci == sel)
+        {
+        h264_frame.stVFrame.u32TimeRef = H264_TimeRef++;
+        h264_frame.stVFrame.u64PTS     = TEST_COMM_GetNowUs();
 
         // ------------------------------------------------------------------
         // Step 3: pick next draw buffer from the ring, copy src into it,
@@ -558,7 +529,7 @@ int main(int argc, char *argv[])
 
 #if USE_RTSP_INPUT
         char cam_text[32];
-        snprintf(cam_text, sizeof(cam_text), "CAM %d", cur_cam_idx + 1);
+        snprintf(cam_text, sizeof(cam_text), "CAM %d", ci + 1);
         cv::putText(draw_frame[cur], cam_text, cv::Point(20, 75),
                     cv::FONT_HERSHEY_SIMPLEX, 1.0,
                     cv::Scalar(255, 255, 0), 2);
@@ -611,24 +582,7 @@ int main(int argc, char *argv[])
                 RK_LOGE("RK_MPI_VENC_ReleaseStream fail %x", s32Ret);
         }
 
-#if USE_RTSP_INPUT
-        // If the active camera's URL was changed via the web UI, reopen it now.
-        {
-            std::lock_guard<std::mutex> lk(cameras_mutex);
-            if (cur_cam_idx >= 0 && cur_cam_idx < (int)cameras.size() &&
-                !cameras[cur_cam_idx].empty() &&
-                cameras[cur_cam_idx] != cur_cam_url) {
-                have_cam = false;
-            }
-        }
-
-        // Round-robin: after the dwell time, rotate to the next camera.
-        // With a single camera this never triggers (continuous processing).
-        if (active_camera_count() > 1 &&
-            difftime(time(NULL), cam_start) >= CAMERA_DWELL_SEC) {
-            have_cam = false;
-        }
-#endif
+        } // end if (ci == sel)
 
         memset(text, 0, sizeof(text));
     }
@@ -654,7 +608,8 @@ int main(int argc, char *argv[])
     if (g_rtsplive) rtsp_del_demo(g_rtsplive);
 
 #if USE_RTSP_INPUT
-    stop_rtsp_reader();
+    for (int i = 0; i < MAX_CAMERAS; i++)
+        stop_reader(&g_readers[i]);
 #endif
 
     RK_MPI_SYS_Exit();

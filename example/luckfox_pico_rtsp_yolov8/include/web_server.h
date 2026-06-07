@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <atomic>
 
 #include "mongoose.h"
 
@@ -11,6 +12,10 @@
 // любой доступ должен брать cameras_mutex.
 extern std::vector<std::string> cameras;
 extern std::mutex cameras_mutex;
+
+// Индекс камеры, чей результат инференса отдаётся в выходной RTSP-стрим.
+// Переключается кнопкой Stream в веб-интерфейсе.
+extern std::atomic<int> g_stream_camera;
 
 // Генерация HTML страницы
 std::string generate_html();
@@ -30,5 +35,8 @@ bool get_next_camera(int &idx, std::string &url);
 
 // Количество настроенных (непустых) камер.
 int active_camera_count();
+
+// Снимок всех слотов камер (копия, потокобезопасно).
+std::vector<std::string> get_all_cameras();
 
 #endif // WEB_SERVER_H

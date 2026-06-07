@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <atomic>
 
 #include <unistd.h>
 #include <sys/wait.h>
@@ -22,6 +23,9 @@ std::vector<std::string> cameras = {
     ""
 };
 std::mutex cameras_mutex;
+
+// Камера, чей инференс уходит в выходной стрим (по умолчанию 0).
+std::atomic<int> g_stream_camera{0};
 
 // Флаг успешной проверки (под тем же мьютексом).
 static std::vector<bool> camera_ok = {
@@ -130,128 +134,81 @@ std::string generate_html() {
 
     html += "];";
 
+    html += "var stream=" + std::to_string(g_stream_camera.load()) + ";";
+
     html +=
         "var tested=[];"
-        "var timer=null;"
-        "var current=-1;"
+        "var saved=[];"
 
         "function init(){"
-
         "var d=document.getElementById('cams');"
         "var h='';"
-
         "for(var i=0;i<cams.length;i++){"
-
         "h+='<div style=\"margin:10px 0;padding:10px;background:#2a2a2a;border-radius:5px;\">';"
-
         "h+='Camera '+(i+1)+'<br>';"
-
-        "h+='<input type=\"text\" "
-        "id=\"url'+i+'\" "
-        "value=\"'+cams[i]+'\" "
+        "h+='<input type=\"text\" id=\"url'+i+'\" value=\"'+cams[i]+'\" "
         "style=\"width:500px;background:#333;color:#fff;border:1px solid #555;padding:5px;\">';"
-
         "h+='<br><br>';"
-
-        "h+='<button onclick=\"saveCam('+i+')\">Save</button> ';"
-
+        "h+='<button id=\"sv'+i+'\" onclick=\"saveCam('+i+')\">Save</button> ';"
         "h+='<button onclick=\"testCam('+i+')\">Test</button> ';"
-
         "h+='<button onclick=\"previewCam('+i+')\">Preview</button> ';"
-
+        "h+='<button id=\"stm'+i+'\" onclick=\"streamCam('+i+')\">Stream</button> ';"
         "h+='<span id=\"st'+i+'\" style=\"margin-left:10px\"></span>';"
-
         "h+='</div>';"
         "}"
-
         "d.innerHTML=h;"
+        "for(var i=0;i<cams.length;i++){if(cams[i])saved[i]=true;}"
+        "refresh();"
+        "}"
+
+        // Подсветка: сохранённая камера -> зелёная кнопка Save;
+        // активный выходной стрим -> синяя кнопка Stream.
+        "function refresh(){"
+        "for(var i=0;i<cams.length;i++){"
+        "var sv=document.getElementById('sv'+i);"
+        "if(sv){sv.style.background=saved[i]?'#2e7d32':'';sv.style.color=saved[i]?'#fff':'';}"
+        "var stm=document.getElementById('stm'+i);"
+        "if(stm){stm.style.background=(stream==i)?'#1565c0':'';stm.style.color=(stream==i)?'#fff':'';}"
+        "}"
         "}"
 
         "function saveCam(i){"
-
         "cams[i]=document.getElementById('url'+i).value;"
         "tested[i]=false;"
-
         "var x=new XMLHttpRequest();"
-
         "x.open('POST','/save',true);"
-
         "x.setRequestHeader('Content-Type','application/json');"
-
+        "x.onload=function(){saved[i]=(cams[i]!=='');refresh();};"
         "x.send(JSON.stringify({i:i,u:cams[i]}));"
-
         "document.getElementById('st'+i).innerHTML='Saved';"
-
         "}"
 
         "function testCam(i){"
-
         "document.getElementById('st'+i).innerHTML='Testing...';"
-
         "var x=new XMLHttpRequest();"
-
         "x.open('POST','/test',true);"
-
         "x.setRequestHeader('Content-Type','application/json');"
-
         "x.onload=function(){"
-
-        "try{"
-
-        "var r=JSON.parse(x.responseText);"
-
-        "tested[i]=r.ok;"
-
-        "document.getElementById('st'+i).innerHTML=r.ok?'OK':'FAIL';"
-
-        "}catch(e){"
-        "document.getElementById('st'+i).innerHTML='FAIL';"
-        "}"
-
+        "try{var r=JSON.parse(x.responseText);tested[i]=r.ok;"
+        "document.getElementById('st'+i).innerHTML=r.ok?'OK':'FAIL';}"
+        "catch(e){document.getElementById('st'+i).innerHTML='FAIL';}"
         "};"
-
         "x.send(JSON.stringify({u:document.getElementById('url'+i).value}));"
-
         "}"
 
+        // Превью — один снимок по нажатию (без авто-обновления).
         "function previewCam(i){"
-
-        "if(!tested[i]){"
-        "alert('Test camera first');"
-        "return;"
+        "if(!tested[i]){alert('Test camera first');return;}"
+        "document.getElementById('snap').src='/snap?id='+i+'&r='+Date.now();"
         "}"
 
-        "current=i;"
-
-        "if(timer){"
-        "clearTimeout(timer);"
-        "timer=null;"
-        "}"
-
-        "loadSnap();"
-
-        "}"
-
-        // Цепочка по onload/onerror вместо setInterval: следующий снимок
-        // запрашивается ТОЛЬКО после полной загрузки предыдущего. Иначе
-        // таймер прерывает (abort) ещё не догруженный запрос, и кадр
-        // никогда не доходит целиком.
-        "function loadSnap(){"
-
-        "if(current<0)return;"
-
-        "var img=document.getElementById('snap');"
-
-        "img.onload=function(){"
-        "if(current>=0)timer=setTimeout(loadSnap,1000);"
-        "};"
-
-        "img.onerror=function(){"
-        "if(current>=0)timer=setTimeout(loadSnap,1500);"
-        "};"
-
-        "img.src='/snap?id='+current+'&r='+Date.now();"
-
+        // Переключение выходного стрима на камеру i.
+        "function streamCam(i){"
+        "var x=new XMLHttpRequest();"
+        "x.open('POST','/stream',true);"
+        "x.setRequestHeader('Content-Type','application/json');"
+        "x.onload=function(){stream=i;refresh();};"
+        "x.send(JSON.stringify({i:i}));"
         "}"
 
         "init();"
@@ -425,6 +382,29 @@ void handle_request(struct mg_connection *c,
         return;
     }
 
+    if (method == "POST" && uri == "/stream") {
+        std::string body(hm->body.buf, hm->body.len);
+
+        size_t ipos = body.find("\"i\":");
+        if (ipos != std::string::npos) {
+            int i = atoi(body.c_str() + ipos + 4);
+            if (i >= 0 && i < (int) cameras.size()) {
+                g_stream_camera.store(i);
+                printf("[stream] output switched to camera %d\n", i);
+
+                mg_http_reply(c, 200,
+                              "Content-Type: application/json\r\n",
+                              "{\"ok\":true}");
+                return;
+            }
+        }
+
+        mg_http_reply(c, 200,
+                      "Content-Type: application/json\r\n",
+                      "{\"ok\":false}");
+        return;
+    }
+
     mg_http_reply(c, 404, "", "Not found\n");
 }
 
@@ -475,4 +455,9 @@ int active_camera_count() {
         if (!s.empty()) cnt++;
     }
     return cnt;
+}
+
+std::vector<std::string> get_all_cameras() {
+    std::lock_guard<std::mutex> lk(cameras_mutex);
+    return cameras;
 }
