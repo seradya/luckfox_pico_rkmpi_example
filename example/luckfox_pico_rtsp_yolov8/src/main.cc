@@ -55,17 +55,6 @@
 // Глобальный MQTT-публикатор (асинхронный, фоновый поток).
 static MqttClient g_mqtt;
 
-// При нескольких настроенных камерах — сколько секунд обрабатывать одну,
-// прежде чем переключиться на следующую (поочерёдная обработка).
-// Переключение пересоздаёт ffmpeg (RTSP-коннект ~1-2 c), поэтому слишком
-// маленькое значение неэффективно.
-#define CAMERA_DWELL_SEC 10
-
-// URL по умолчанию для слота камеры 0 — чтобы можно было сразу тестировать
-// с одним источником, не открывая веб-интерфейс. Веб-интерфейс может его
-// переопределить. Также можно передать первым аргументом командной строки.
-const std::string DEFAULT_RTSP_URL = "rtsp://172.32.0.100:8554/live";
-
 int width        = DISP_WIDTH;
 int height       = DISP_HEIGHT;
 int model_width  = 640;
@@ -86,13 +75,16 @@ cv::Mat letterbox(const cv::Mat &input)
     leftPadding = (model_width  - inputWidth)  / 2;
     topPadding  = (model_height - inputHeight) / 2;
 
-    cv::Mat inputScale;
-    cv::resize(input, inputScale,
+    // Постоянный буфер: чёрные поля заливаются один раз, далее каждый кадр
+    // ресайзим прямо в ROI — без аллокаций cv::Mat и copyTo на каждом кадре.
+    static cv::Mat out;
+    if (out.empty())
+        out = cv::Mat(model_height, model_width, CV_8UC3, cv::Scalar(0, 0, 0));
+
+    cv::resize(input,
+               out(cv::Rect(leftPadding, topPadding, inputWidth, inputHeight)),
                cv::Size(inputWidth, inputHeight), 0, 0, cv::INTER_LINEAR);
-    cv::Mat letterboxImage(model_height, model_width, CV_8UC3, cv::Scalar(0, 0, 0));
-    inputScale.copyTo(letterboxImage(cv::Rect(leftPadding, topPadding,
-                                              inputWidth, inputHeight)));
-    return letterboxImage;
+    return out;
 }
 
 // Build the ffmpeg command that decodes one RTSP source to raw rgb24 frames.
@@ -327,16 +319,14 @@ int main(int argc, char *argv[])
     // -------------------------------------------------------------------------
     // Camera configuration + web server
     //
-    // Camera URLs are managed by the web UI (port WEB_SERVER_PORT). We seed
-    // slot 0 from argv[1] (or a built-in default) so single-source testing works
-    // out of the box; the web UI can override and add up to 4 cameras.
+    // На старте НИ ОДИН стрим не запускается: камеры задаются через веб-интерфейс
+    // (порт WEB_SERVER_PORT). Только если URL передан явно в argv[1], он
+    // подставляется в слот 0 (для отладки одним источником).
     // -------------------------------------------------------------------------
+    if (argc > 1 && argv[1][0] != '\0')
     {
         std::lock_guard<std::mutex> lk(cameras_mutex);
-        if (argc > 1 && argv[1][0] != '\0')
-            cameras[0] = argv[1];
-        else if (cameras[0].empty())
-            cameras[0] = DEFAULT_RTSP_URL;
+        cameras[0] = argv[1];
     }
     std::thread(run_web_server, WEB_SERVER_PORT).detach();
     printf("Web UI: http://<board-ip>:%d (configure up to 4 cameras)\n",
@@ -527,9 +517,17 @@ int main(int argc, char *argv[])
                      0.25f, 0.45f, &od_results);
 
 #if USE_RTSP_INPUT
-        // Minimal log so we can confirm inference runs for every camera.
-        printf("[cam %d] %d objects (infer %.1f fps)%s\n",
-               ci, od_results.count, fps, (ci == sel) ? " [STREAM]" : "");
+        // Лёгкий статус-лог не чаще раза в 3 с на камеру (печать в консоль на
+        // каждом кадре заметно роняет FPS, особенно через adb/serial).
+        {
+            static double last_log[MAX_CAMERAS] = {0};
+            double tnow = now_seconds();
+            if (tnow - last_log[ci] >= 3.0) {
+                last_log[ci] = tnow;
+                printf("[cam %d] %d obj, %.1f infer-fps%s\n",
+                       ci, od_results.count, fps, (ci == sel) ? " [STREAM]" : "");
+            }
+        }
 
         // ------------------------------------------------------------------
         // Экспорт результатов инференса: JSON-файл (для Frigate/NVR) и/или

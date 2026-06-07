@@ -24,8 +24,9 @@ std::vector<std::string> cameras = {
 };
 std::mutex cameras_mutex;
 
-// Камера, чей инференс уходит в выходной стрим (по умолчанию 0).
-std::atomic<int> g_stream_camera{0};
+// Камера, чей инференс уходит в выходной стрим. -1 = ни одна (на старте
+// стрим не запущен, пока пользователь не нажмёт Stream).
+std::atomic<int> g_stream_camera{-1};
 
 // Настройки экспорта (MQTT/JSON). Доступ только под mqtt_settings_mutex.
 static MqttSettings g_mqtt_settings;
@@ -116,12 +117,7 @@ static bool capture_snapshot_to_file(const std::string& url, const std::string& 
         "-y "
         "-f mjpeg '" + path + "'";
 
-    printf("[SNAP CMD] %s\n", cmd.c_str());
-
     int rc = system(cmd.c_str());
-
-    printf("[SNAP rc] %d\n", rc);
-
     return rc == 0;
 }
 
