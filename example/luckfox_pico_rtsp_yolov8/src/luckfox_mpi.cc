@@ -96,8 +96,10 @@ int venc_init(int chnId, int width, int height, RK_CODEC_ID_E enType) {
 
 	if (enType == RK_VIDEO_ID_AVC) {
 		stAttr.stRcAttr.enRcMode = VENC_RC_MODE_H264CBR;
-		stAttr.stRcAttr.stH264Cbr.u32BitRate = 10 * 1024;
-		stAttr.stRcAttr.stH264Cbr.u32Gop = 1;
+		// Short GOP: the output goes over RTP/UDP, so any lost packet corrupts
+		// the picture until the next keyframe. A small GOP recovers quickly.
+		stAttr.stRcAttr.stH264Cbr.u32BitRate = 16 * 1024;
+		stAttr.stRcAttr.stH264Cbr.u32Gop = 15;
 	} else if (enType == RK_VIDEO_ID_HEVC) {
 		stAttr.stRcAttr.enRcMode = VENC_RC_MODE_H265CBR;
 		stAttr.stRcAttr.stH265Cbr.u32BitRate = 10 * 1024;
@@ -115,8 +117,8 @@ int venc_init(int chnId, int width, int height, RK_CODEC_ID_E enType) {
 	stAttr.stVencAttr.u32PicHeight = height;
 	stAttr.stVencAttr.u32VirWidth = width;
 	stAttr.stVencAttr.u32VirHeight = height;
-	stAttr.stVencAttr.u32StreamBufCnt = 2;
-	stAttr.stVencAttr.u32BufSize = width * height * 3 / 2;
+	stAttr.stVencAttr.u32StreamBufCnt = 4;
+	stAttr.stVencAttr.u32BufSize = width * height * 2;
 	stAttr.stVencAttr.enMirror = MIRROR_NONE;
 
 	RK_MPI_VENC_CreateChn(chnId, &stAttr);
